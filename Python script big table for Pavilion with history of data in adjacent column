@@ -1,0 +1,143 @@
+
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+
+pip install pandas watchdog
+
+
+# In[ ]:
+
+
+import pandas as pd
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+from datetime import datetime, timedelta
+import os
+import time
+
+# Paths to sensor data tables
+humidity_data_path = #please insert sensor data value file path location details
+temp_data_path = #please insert sensor data value file path location details
+big_table_path = #please insert sensor data value file path location details
+
+# Global variables
+last_modified_time = datetime.now()
+data_changed = False
+
+def load_and_merge_tables(final_save=False):
+    """Load sensor data, merge tables, and update the big table with historical values."""
+    global last_modified_time
+
+    # Check for sensor files
+    if not os.path.exists(humidity_data_path) or not os.path.exists(temp_data_path):
+        print("Error: One or both sensor data files do not exist.")
+        return
+
+    # Load sensor data
+    humidity_data = pd.read_csv(humidity_data_path)
+    temp_data = pd.read_csv(temp_data_path)
+    #water_level_data = pd.read_csv(water_level_data_path)
+    #water_temp_data = pd.read_csv(water_temp_data_path)
+
+    # Merge tables
+    if 'timestamp' in humidity_data.columns and 'timestamp' in temp_data.columns:
+        big_table = pd.merge(humidity_data, temp_data, on='timestamp', how='outer')
+    else:
+        big_table = pd.concat([humidity_data.reset_index(drop=True), temp_data.reset_index(drop=True)], axis=1)
+
+    # Load existing big table
+    if os.path.exists(big_table_path):
+        old_big_table = pd.read_csv(big_table_path)
+    else:
+        old_big_table = pd.DataFrame()
+
+    # Update historical values
+    big_table = update_historical_values(big_table, old_big_table)
+
+    # Save the updated table if necessary
+    if final_save or data_changed:
+        save_big_table(big_table)
+
+def update_historical_values(new_table, old_table):
+    """Update historical columns for humidity and temperature values."""
+    for sensor in [("humidity", 2), ("temperature", 6)
+                  ]:  # Adjust indices as needed
+        sensor_prefix, col_index = sensor
+
+        # Collect all existing historical columns (both in old and new tables)
+        historical_columns_old = [
+            col for col in old_table.columns if col.startswith(f"{sensor_prefix}_previous_value_")
+        ] if not old_table.empty else []
+        historical_columns_new = [
+            col for col in new_table.columns if col.startswith(f"{sensor_prefix}_previous_value_")
+        ]
+
+        # Combine and determine the next column index
+        all_historical_columns = sorted(set(historical_columns_old + historical_columns_new))
+        next_column_index = len(all_historical_columns) + 1
+        next_column_name = f"{sensor_prefix}_previous_value_{next_column_index}"
+
+        # Append the current sensor values to the new historical column
+        new_table[next_column_name] = new_table.iloc[:, col_index]
+
+        # Preserve historical columns from the old table into the new table
+        for col in historical_columns_old:
+            if col not in new_table.columns:
+                new_table[col] = old_table[col]
+
+    return new_table        
+
+def save_big_table(big_table):
+    """Save the big table, retrying if the file is locked."""
+    while True:
+        try:
+            big_table.to_csv(big_table_path, index=False)
+            print(f"Big table saved successfully at {datetime.now()}.")
+            break
+        except PermissionError:
+            print("Error: File is currently open. Retrying in 10 seconds...")
+            time.sleep(10)
+
+# Event handling for sensor data changes
+class TableChangeHandler(FileSystemEventHandler):
+    def on_modified(self, event):
+        global data_changed
+        if event.src_path in [humidity_data_path, temp_data_path]:
+            print(f"Change detected in {event.src_path}.")
+            data_changed = True
+
+# Set up observer
+event_handler = TableChangeHandler()
+observer = Observer()
+observer.schedule(event_handler, os.path.dirname(humidity_data_path), recursive=False)
+observer.start()
+
+# Initial load
+load_and_merge_tables()
+
+# Monitor for changes
+try:
+    while True:
+        time.sleep(5)
+        if data_changed:
+            print("Detected changes. Updating big table...")
+            load_and_merge_tables()
+            data_changed = False
+
+        # Check for inactivity
+        if datetime.now() - last_modified_time > timedelta(minutes=20):
+            print("No changes for 20 minutes. Saving and exiting.")
+            load_and_merge_tables(final_save=True)
+            break
+
+except KeyboardInterrupt:
+    print("Script interrupted. Saving before exit.")
+    load_and_merge_tables(final_save=True)
+    observer.stop()
+
+# Clean up observer
+observer.join()
+print("Script terminated.")
