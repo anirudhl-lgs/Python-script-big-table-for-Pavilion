@@ -1,0 +1,135 @@
+import pandas as pd
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+from datetime import datetime, timedelta
+import time
+import os
+
+# Paths to sensor data tables
+humidity_data_path = #please insert necessary path for the sensor data value file location
+temp_data_path = #please insert necessary path for the sensor data value file location
+big_table_path = #please insert necessary path for the sensor data value file location
+
+# Threshold ranges for humidity and temperature
+HUMIDITY_THRESHOLD_MIN, HUMIDITY_THRESHOLD_MAX = 50, 60
+TEMPERATURE_THRESHOLD_MIN, TEMPERATURE_THRESHOLD_MAX = 20, 30
+
+# Global variables to track last modification time and data change status
+last_modified_time = datetime.now()
+data_changed = False
+
+def load_and_merge_tables(final_save=False):
+    """Load and merge tables, and update the big table based on threshold conditions."""
+    global last_modified_time
+
+    # Check if both sensor data files exist before reading
+    if not os.path.exists(humidity_data_path) or not os.path.exists(temp_data_path):
+        print("Error: One or both sensor data files do not exist.")
+        return
+
+    # Load individual tables
+    humidity_data = pd.read_csv(humidity_data_path)
+    temp_data = pd.read_csv(temp_data_path)
+
+    # Merge tables based on available columns
+    if 'timestamp' in humidity_data.columns and 'timestamp' in temp_data.columns:
+        big_table = pd.merge(humidity_data, temp_data, on='timestamp', how='outer')
+    else:
+        big_table = pd.concat([humidity_data.reset_index(drop=True), temp_data.reset_index(drop=True)], axis=1)
+
+    # Load the current big table
+    if os.path.exists(big_table_path):
+        old_big_table = pd.read_csv(big_table_path)
+    else:
+        old_big_table = pd.DataFrame()
+
+    # Check if updates are required based on the new threshold conditions
+    update_required = False
+
+    for idx, row in big_table.iterrows():
+        humidity_value = row.iloc[2]  # 3rd column for humidity data
+        temperature_value = row.iloc[6]  # 3rd column for temperature data
+
+        if idx < len(old_big_table):
+            old_row = old_big_table.iloc[idx]
+            old_humidity_value = old_row.iloc[2] if len(old_row) > 2 else None
+            old_temperature_value = old_row.iloc[6] if len(old_row) > 6 else None
+
+            # Check if only the 3rd column changed
+            humidity_changed = humidity_value != old_humidity_value
+            temperature_changed = temperature_value != old_temperature_value
+
+            # Check if humidity needs updating
+            if humidity_changed:
+                # Update if it goes from outside to inside the threshold range or vice versa
+                old_outside_range = old_humidity_value is not None and not (HUMIDITY_THRESHOLD_MIN <= old_humidity_value <= HUMIDITY_THRESHOLD_MAX)
+                new_inside_range = HUMIDITY_THRESHOLD_MIN <= humidity_value <= HUMIDITY_THRESHOLD_MAX
+                if (old_outside_range and new_inside_range) or not new_inside_range:
+                    update_required = True
+
+            # Check if temperature needs updating
+            if temperature_changed:
+                # Update if it goes from outside to inside the threshold range or vice versa
+                old_outside_range = old_temperature_value is not None and not (TEMPERATURE_THRESHOLD_MIN <= old_temperature_value <= TEMPERATURE_THRESHOLD_MAX)
+                new_inside_range = TEMPERATURE_THRESHOLD_MIN <= temperature_value <= TEMPERATURE_THRESHOLD_MAX
+                if (old_outside_range and new_inside_range) or not new_inside_range:
+                    update_required = True
+
+        else:
+            # If new data, update is required
+            update_required = True
+
+    # Update the big table if required or if it's a final save before exit
+    if update_required or final_save:
+        try:
+            big_table.to_csv(big_table_path, index=False)
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"Pavilion sensor big table updated at {current_time}.")
+            last_modified_time = datetime.now()
+        except PermissionError:
+            print(f"Warning: The file '{big_table_path}' is currently open. Retrying in 5 seconds...")
+            time.sleep(5)
+
+# Custom event handler for file changes
+class TableChangeHandler(FileSystemEventHandler):
+    def on_modified(self, event):
+        global data_changed
+        if event.src_path in [humidity_data_path, temp_data_path]:
+            print(f"Change detected in {event.src_path}.")
+            data_changed = True
+
+# Set up and start the observer
+event_handler = TableChangeHandler()
+observer = Observer()
+observer.schedule(event_handler, os.path.dirname(humidity_data_path), recursive=False)
+observer.start()
+
+# Load tables initially
+load_and_merge_tables()
+
+# Monitoring loop with inactivity timeout
+try:
+    while True:
+        time.sleep(5)
+        time_since_last_change = datetime.now() - last_modified_time
+
+        # If data has changed, reload and reset the timer
+        if data_changed:
+            print("Detected changes in sensor data. Updating pavilion sensor big table...")
+            load_and_merge_tables()
+            data_changed = False
+
+        # Exit if no changes for 20 minutes
+        if time_since_last_change > timedelta(minutes=2):
+            print("No changes detected for 20 minutes. Performing final update before exiting...")
+            load_and_merge_tables(final_save=True)
+            break
+
+except KeyboardInterrupt:
+    print("Script interrupted by user. Performing final update before exiting...")
+    load_and_merge_tables(final_save=True)
+    observer.stop()
+
+# Clean up observer
+observer.join()
+print("Script terminated.")
